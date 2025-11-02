@@ -9,7 +9,7 @@ import io
 
 # Page configuration
 st.set_page_config(
-    page_title="Plus500 Trading Journal",
+    page_title="Trading Journal",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -41,7 +41,7 @@ def main():
     
     # Sidebar
     st.sidebar.title("Data Input")
-    st.sidebar.markdown("Upload your Plus500 monthly statement PDF")
+    st.sidebar.markdown("Upload your monthly statement PDF")
     
     uploaded_file = st.sidebar.file_uploader("Choose PDF file", type="pdf")
     
