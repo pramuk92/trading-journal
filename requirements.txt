@@ -2,6 +2,5 @@ streamlit
 pandas
 plotly
 pymupdf
-re
 datetime
 numpy
