@@ -23,7 +23,7 @@ def main():
     st.title("📊 Trading Journal Analyzer")
     st.markdown("""
     Upload your trading history CSV file to analyze your performance.
-    *Currently compatible with CSV exports from various brokers.*
+    *Currently compatible with CSV exports from various brokers. It is compatible with the csv file provided by Plus500 US Futures*
     """)
     
     # File upload
