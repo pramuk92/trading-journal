@@ -194,57 +194,58 @@ class Plus500Parser:
         else:
             return float(amount_str)
 
-class TradingAnalysis:
-    def __init__(self, trades_df: pd.DataFrame):
-        self.trades_df = trades_df.copy()
-        if not self.trades_df.empty:
-            self._preprocess_data()
+def preprocess_trades_data(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """Preprocess trade data for analysis - add calculated columns"""
+    if trades_df.empty:
+        return trades_df
     
-    def _preprocess_data(self):
-        """Preprocess trade data for analysis"""
-        self.trades_df['win'] = self.trades_df['net_pnl'] > 0
-        self.trades_df['cumulative_pnl'] = self.trades_df['net_pnl'].cumsum()
-        self.trades_df['trade_day'] = self.trades_df['trade_date'].dt.date
-        self.trades_df['day_of_week'] = self.trades_df['trade_date'].dt.day_name()
+    df = trades_df.copy()
+    df['win'] = df['net_pnl'] > 0
+    df['cumulative_pnl'] = df['net_pnl'].cumsum()
+    df['trade_day'] = df['trade_date'].dt.date
+    df['day_of_week'] = df['trade_date'].dt.day_name()
+    df['week_number'] = df['trade_date'].dt.isocalendar().week
     
-    def get_summary_metrics(self) -> Dict:
-        """Calculate key trading performance metrics"""
-        if self.trades_df.empty:
-            return {}
-        
-        total_trades = len(self.trades_df)
-        winning_trades = self.trades_df['win'].sum()
-        losing_trades = total_trades - winning_trades
-        
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        total_pnl = self.trades_df['net_pnl'].sum()
-        avg_win = self.trades_df[self.trades_df['win']]['net_pnl'].mean() if winning_trades > 0 else 0
-        avg_loss = self.trades_df[~self.trades_df['win']]['net_pnl'].mean() if losing_trades > 0 else 0
-        
-        # Profit factor: gross profits / gross losses
-        gross_profit = self.trades_df[self.trades_df['net_pnl'] > 0]['net_pnl'].sum()
-        gross_loss = abs(self.trades_df[self.trades_df['net_pnl'] < 0]['net_pnl'].sum())
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-        
-        max_win = self.trades_df['net_pnl'].max()
-        max_loss = self.trades_df['net_pnl'].min()
-        avg_trade = self.trades_df['net_pnl'].mean()
-        
-        return {
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'losing_trades': losing_trades,
-            'win_rate': win_rate,
-            'total_pnl': total_pnl,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'profit_factor': profit_factor,
-            'max_win': max_win,
-            'max_loss': max_loss,
-            'avg_trade': avg_trade,
-            'gross_profit': gross_profit,
-            'gross_loss': gross_loss
-        }
+    return df
+
+def get_summary_metrics(trades_df: pd.DataFrame) -> Dict:
+    """Calculate key trading performance metrics"""
+    if trades_df.empty:
+        return {}
+    
+    total_trades = len(trades_df)
+    winning_trades = trades_df['win'].sum()
+    losing_trades = total_trades - winning_trades
+    
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    total_pnl = trades_df['net_pnl'].sum()
+    avg_win = trades_df[trades_df['win']]['net_pnl'].mean() if winning_trades > 0 else 0
+    avg_loss = trades_df[~trades_df['win']]['net_pnl'].mean() if losing_trades > 0 else 0
+    
+    # Profit factor: gross profits / gross losses
+    gross_profit = trades_df[trades_df['net_pnl'] > 0]['net_pnl'].sum()
+    gross_loss = abs(trades_df[trades_df['net_pnl'] < 0]['net_pnl'].sum())
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+    
+    max_win = trades_df['net_pnl'].max()
+    max_loss = trades_df['net_pnl'].min()
+    avg_trade = trades_df['net_pnl'].mean()
+    
+    return {
+        'total_trades': total_trades,
+        'winning_trades': winning_trades,
+        'losing_trades': losing_trades,
+        'win_rate': win_rate,
+        'total_pnl': total_pnl,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'profit_factor': profit_factor,
+        'max_win': max_win,
+        'max_loss': max_loss,
+        'avg_trade': avg_trade,
+        'gross_profit': gross_profit,
+        'gross_loss': gross_loss
+    }
 
 def create_pnl_chart(trades_df: pd.DataFrame):
     """Create cumulative P&L chart"""
@@ -255,6 +256,10 @@ def create_pnl_chart(trades_df: pd.DataFrame):
                           xref="paper", yref="paper",
                           x=0.5, y=0.5, showarrow=False)
         return fig
+    
+    # Make sure we have the cumulative_pnl column
+    if 'cumulative_pnl' not in trades_df.columns:
+        trades_df = preprocess_trades_data(trades_df)
     
     fig = go.Figure()
     
@@ -283,6 +288,10 @@ def create_win_loss_pie(trades_df: pd.DataFrame):
                           xref="paper", yref="paper",
                           x=0.5, y=0.5, showarrow=False)
         return fig
+    
+    # Make sure we have the win column
+    if 'win' not in trades_df.columns:
+        trades_df = preprocess_trades_data(trades_df)
     
     win_count = trades_df['win'].sum()
     loss_count = len(trades_df) - win_count
@@ -332,6 +341,10 @@ def create_daily_performance(trades_df: pd.DataFrame):
                           x=0.5, y=0.5, showarrow=False)
         return fig
     
+    # Make sure we have the trade_day column
+    if 'trade_day' not in trades_df.columns:
+        trades_df = preprocess_trades_data(trades_df)
+    
     daily_pnl = trades_df.groupby('trade_day')['net_pnl'].sum()
     
     fig = go.Figure(data=[go.Bar(
@@ -377,9 +390,11 @@ def main():
             
             # Parse PDF
             parser = Plus500Parser()
-            st.session_state.trades_df = parser.parse_pdf("temp_statement.pdf")
+            raw_trades_df = parser.parse_pdf("temp_statement.pdf")
             
-            if not st.session_state.trades_df.empty:
+            # Preprocess the data for analysis
+            if not raw_trades_df.empty:
+                st.session_state.trades_df = preprocess_trades_data(raw_trades_df)
                 st.sidebar.success(f"✅ Successfully parsed {len(st.session_state.trades_df)} trades!")
                 # Show a preview of the parsed data
                 preview_df = st.session_state.trades_df[['trade_date', 'instrument', 'net_pnl']].copy()
@@ -422,11 +437,12 @@ def display_welcome():
 def display_analysis(trades_df):
     """Display trading analysis and visualizations"""
     
-    # Initialize analysis
-    analysis = TradingAnalysis(trades_df)
+    # Make sure data is preprocessed
+    if 'cumulative_pnl' not in trades_df.columns:
+        trades_df = preprocess_trades_data(trades_df)
     
     # Summary metrics
-    metrics = analysis.get_summary_metrics()
+    metrics = get_summary_metrics(trades_df)
     
     # Display key metrics
     st.markdown("## 📊 Trading Performance Summary")
@@ -495,7 +511,17 @@ def display_analysis(trades_df):
     display_df['commission'] = display_df['commission'].round(2)
     display_df['net_pnl'] = display_df['net_pnl'].round(2)
     
-    st.dataframe(display_df, use_container_width=True)
+    st.dataframe(display_df[['trade_date', 'instrument', 'exchange', 'pnl', 'commission', 'net_pnl', 'direction']], 
+                 use_container_width=True)
+    
+    # Instrument analysis
+    st.markdown("## 🔍 Instrument Analysis")
+    instrument_analysis = trades_df.groupby('instrument').agg({
+        'net_pnl': ['count', 'sum', 'mean', 'std'],
+        'win': 'mean'
+    }).round(2)
+    if not instrument_analysis.empty:
+        st.dataframe(instrument_analysis, use_container_width=True)
     
     # Export data
     st.markdown("## 💾 Export Data")
