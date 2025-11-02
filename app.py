@@ -6,7 +6,7 @@ from datetime import datetime
 import re
 import fitz  # PyMuPDF
 import base64
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 # Page configuration
 st.set_page_config(
@@ -37,35 +37,42 @@ st.markdown("""
 
 class Plus500Parser:
     def parse_pdf(self, pdf_path: str) -> pd.DataFrame:
-        """Parse Plus500 PDF statement and extract trades"""
+        """Parse Plus500 PDF statement and extract trades from the line-by-line table"""
         doc = fitz.open(pdf_path)
         full_text = ""
         for page in doc:
             full_text += page.get_text()
         doc.close()
         
-        return self._extract_trades_simple(full_text)
+        return self._extract_trades_from_lines(full_text)
     
-    def _extract_trades_simple(self, text: str) -> pd.DataFrame:
-        """Simple but robust trade extraction"""
+    def _extract_trades_from_lines(self, text: str) -> pd.DataFrame:
+        """Extract trades from the line-by-line table format"""
         trades = []
         lines = text.split('\n')
         
-        i = 0
+        # Find the start of the activity section
+        activity_start = -1
+        for i, line in enumerate(lines):
+            if "YOUR ACTIVITY THIS MONTH" in line:
+                activity_start = i
+                break
+        
+        if activity_start == -1:
+            return pd.DataFrame()
+        
+        # Process lines in the activity section
+        i = activity_start + 1
         while i < len(lines):
             line = lines[i].strip()
             
-            # Look for date patterns (MM/DD/YYYY)
-            date_match = re.match(r'^(\d{2}/\d{2}/\d{4})$', line)
-            if date_match:
-                trade_date_str = date_match.group(1)
-                
-                # Look ahead in next lines for trade information
-                trade_info = self._find_trade_info(trade_date_str, lines[i:min(i+10, len(lines))])
-                if trade_info:
-                    trades.append(trade_info)
-                    # Skip ahead since we found a trade
-                    i += 3
+            # Look for date lines (these mark the start of trade entries)
+            if re.match(r'^\d{2}/\d{2}/\d{4}$', line):
+                trade_data = self._parse_trade_block(lines, i)
+                if trade_data:
+                    trades.append(trade_data)
+                    # Skip ahead since we processed a block
+                    i += self._get_trade_block_size(lines, i)
                 else:
                     i += 1
             else:
@@ -73,33 +80,47 @@ class Plus500Parser:
         
         return pd.DataFrame(trades)
     
-    def _find_trade_info(self, trade_date: str, context_lines: List[str]) -> Optional[Dict]:
-        """Find trade information in context lines following a date"""
-        context_text = ' | '.join([line.strip() for line in context_lines if line.strip()])
-        
-        # Look for PNL entries
-        pnl_matches = re.finditer(r'PNL\s+USD\s+([\(\)\d\.,]+)\*?', context_text)
-        
-        for pnl_match in pnl_matches:
-            pnl_str = pnl_match.group(1)
-            pnl = self._parse_amount(pnl_str)
+    def _parse_trade_block(self, lines: List[str], start_idx: int) -> Optional[Dict]:
+        """Parse a block of lines that represent one trade entry"""
+        try:
+            # The first line should be the date
+            trade_date_str = lines[start_idx].strip()
+            trade_date = datetime.strptime(trade_date_str, '%m/%d/%Y')
             
-            # Extract instrument from the context
-            instrument = self._extract_instrument(context_text)
-            
-            # Extract exchange
+            # Look ahead to find PNL and commission information
+            pnl = 0.0
+            commission = 0.0
+            instrument = "Unknown"
             exchange = "UNKNOWN"
-            if 'CBOT' in context_text:
-                exchange = 'CBOT'
-            elif 'CME' in context_text:
-                exchange = 'CME'
             
-            # Find corresponding commission
-            commission = self._find_commission(context_text)
+            # Scan next 15 lines for trade information
+            for i in range(start_idx + 1, min(start_idx + 15, len(lines))):
+                line = lines[i].strip()
+                
+                # Look for instrument names
+                if not instrument or instrument == "Unknown":
+                    instrument = self._extract_instrument_from_line(line)
+                
+                # Look for exchange
+                if exchange == "UNKNOWN":
+                    if 'CBOT' in line:
+                        exchange = 'CBOT'
+                    elif 'CME' in line:
+                        exchange = 'CME'
+                
+                # Look for PNL
+                if pnl == 0 and 'PNL' in line:
+                    # The amount might be in this line or next lines
+                    pnl = self._find_amount_nearby(lines, i, 'PNL')
+                
+                # Look for Commission
+                if commission == 0 and ('FEE/COMM' in line or 'COMM' in line):
+                    commission = self._find_amount_nearby(lines, i, 'COMM')
             
-            if instrument:
+            # Only return if we found meaningful data
+            if pnl != 0 or commission != 0:
                 return {
-                    'trade_date': datetime.strptime(trade_date, '%m/%d/%Y'),
+                    'trade_date': trade_date,
                     'instrument': instrument,
                     'exchange': exchange,
                     'pnl': pnl,
@@ -107,32 +128,60 @@ class Plus500Parser:
                     'net_pnl': pnl + commission,
                     'direction': 'LONG' if pnl > 0 else 'SHORT'
                 }
-        
-        return None
+            
+            return None
+            
+        except Exception as e:
+            return None
     
-    def _extract_instrument(self, text: str) -> str:
-        """Extract instrument name from text"""
-        # Common Plus500 futures instruments
-        patterns = [
-            r'Micro E-mini Dow Jones Industrial Average Index Futures',
-            r'Micro Nikkei \(USD\) Futures',
-            r'Dec \d+ Micro E-mini Dow Jones Industrial Average Index Futures',
-            r'Dec \d+ Micro Nikkei \(USD\) Futures',
+    def _find_amount_nearby(self, lines: List[str], idx: int, pattern: str) -> float:
+        """Find amount near a line containing specific pattern"""
+        # Check current line and next 3 lines for amount
+        for i in range(idx, min(idx + 4, len(lines))):
+            line = lines[i].strip()
+            
+            # Look for amount patterns
+            amount_match = re.search(r'USD\s+([\(\)\d\.,]+)\*?', line)
+            if amount_match:
+                return self._parse_amount(amount_match.group(1))
+            
+            # Also check for standalone amounts
+            amount_match = re.search(r'^([\(\)\d\.,]+)\*?$', line)
+            if amount_match:
+                return self._parse_amount(amount_match.group(1))
+        
+        return 0.0
+    
+    def _extract_instrument_from_line(self, line: str) -> str:
+        """Extract instrument name from a line"""
+        instruments = [
+            'Micro E-mini Dow Jones Industrial Average Index Futures',
+            'Micro Nikkei (USD) Futures',
+            'Dec 25 Micro E-mini Dow Jones Industrial Average Index Futures',
+            'Dec 25 Micro Nikkei (USD) Futures',
         ]
         
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(0)
+        for instrument in instruments:
+            if instrument in line:
+                return instrument
+        
+        # Check for partial matches
+        if 'Micro E-mini Dow' in line:
+            return 'Micro E-mini Dow Jones Industrial Average Index Futures'
+        elif 'Micro Nikkei' in line:
+            return 'Micro Nikkei (USD) Futures'
         
         return "Unknown Instrument"
     
-    def _find_commission(self, text: str) -> float:
-        """Find commission amount in text"""
-        comm_match = re.search(r'FEE/COMM\s+USD\s+([\(\)\d\.,]+)\*?', text)
-        if comm_match:
-            return self._parse_amount(comm_match.group(1))
-        return 0.0
+    def _get_trade_block_size(self, lines: List[str], start_idx: int) -> int:
+        """Estimate how many lines a trade block occupies"""
+        # Look for the next date or end of section
+        for i in range(start_idx + 1, min(start_idx + 20, len(lines))):
+            if re.match(r'^\d{2}/\d{2}/\d{4}$', lines[i].strip()):
+                return i - start_idx
+            if 'YOUR CASH ACTIVITY' in lines[i] or 'ACCOUNT SUMMARY' in lines[i]:
+                return i - start_idx
+        return 10  # Default block size
     
     def _parse_amount(self, amount_str: str) -> float:
         """Parse amount string with bracket notation for losses"""
@@ -144,43 +193,6 @@ class Plus500Parser:
             return -float(number_str)
         else:
             return float(amount_str)
-    
-    def debug_pdf_structure(self, pdf_path: str) -> str:
-        """Debug method to see PDF structure"""
-        doc = fitz.open(pdf_path)
-        debug_info = "PDF STRUCTURE ANALYSIS:\n\n"
-        
-        for page_num, page in enumerate(doc):
-            text = page.get_text()
-            lines = text.split('\n')
-            
-            debug_info += f"=== PAGE {page_num + 1} ===\n"
-            debug_info += f"Total lines: {len(lines)}\n"
-            
-            # Find activity section
-            for i, line in enumerate(lines):
-                if "YOUR ACTIVITY THIS MONTH" in line:
-                    debug_info += f"Found ACTIVITY section at line {i}\n"
-                    # Show context around activity section
-                    start = max(0, i-2)
-                    end = min(len(lines), i+10)
-                    debug_info += "Context lines:\n"
-                    for j in range(start, end):
-                        debug_info += f"  {j}: {lines[j]}\n"
-                    break
-            
-            # Find dates and potential trades
-            date_lines = []
-            for i, line in enumerate(lines):
-                if re.match(r'\d{2}/\d{2}/\d{4}', line):
-                    date_lines.append(f"  Line {i}: {line}")
-            
-            if date_lines:
-                debug_info += f"Date lines found: {len(date_lines)}\n"
-                debug_info += "\n".join(date_lines[:10]) + "\n"
-        
-        doc.close()
-        return debug_info
 
 class TradingAnalysis:
     def __init__(self, trades_df: pd.DataFrame):
@@ -193,6 +205,7 @@ class TradingAnalysis:
         self.trades_df['win'] = self.trades_df['net_pnl'] > 0
         self.trades_df['cumulative_pnl'] = self.trades_df['net_pnl'].cumsum()
         self.trades_df['trade_day'] = self.trades_df['trade_date'].dt.date
+        self.trades_df['day_of_week'] = self.trades_df['trade_date'].dt.day_name()
     
     def get_summary_metrics(self) -> Dict:
         """Calculate key trading performance metrics"""
@@ -236,7 +249,12 @@ class TradingAnalysis:
 def create_pnl_chart(trades_df: pd.DataFrame):
     """Create cumulative P&L chart"""
     if trades_df.empty:
-        return go.Figure()
+        # Return empty chart with message
+        fig = go.Figure()
+        fig.add_annotation(text="No trade data available",
+                          xref="paper", yref="paper",
+                          x=0.5, y=0.5, showarrow=False)
+        return fig
     
     fig = go.Figure()
     
@@ -260,7 +278,11 @@ def create_pnl_chart(trades_df: pd.DataFrame):
 def create_win_loss_pie(trades_df: pd.DataFrame):
     """Create win/loss pie chart"""
     if trades_df.empty:
-        return go.Figure()
+        fig = go.Figure()
+        fig.add_annotation(text="No trade data available",
+                          xref="paper", yref="paper",
+                          x=0.5, y=0.5, showarrow=False)
+        return fig
     
     win_count = trades_df['win'].sum()
     loss_count = len(trades_df) - win_count
@@ -278,7 +300,11 @@ def create_win_loss_pie(trades_df: pd.DataFrame):
 def create_instrument_performance(trades_df: pd.DataFrame):
     """Create bar chart of performance by instrument"""
     if trades_df.empty:
-        return go.Figure()
+        fig = go.Figure()
+        fig.add_annotation(text="No trade data available",
+                          xref="paper", yref="paper",
+                          x=0.5, y=0.5, showarrow=False)
+        return fig
     
     instrument_pnl = trades_df.groupby('instrument')['net_pnl'].sum().sort_values()
     
@@ -293,6 +319,31 @@ def create_instrument_performance(trades_df: pd.DataFrame):
         title='Total P&L by Instrument',
         xaxis_title='Net P&L (USD)',
         yaxis_title='Instrument'
+    )
+    
+    return fig
+
+def create_daily_performance(trades_df: pd.DataFrame):
+    """Create daily performance chart"""
+    if trades_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No trade data available",
+                          xref="paper", yref="paper",
+                          x=0.5, y=0.5, showarrow=False)
+        return fig
+    
+    daily_pnl = trades_df.groupby('trade_day')['net_pnl'].sum()
+    
+    fig = go.Figure(data=[go.Bar(
+        x=daily_pnl.index,
+        y=daily_pnl.values,
+        marker_color=['#00D4AA' if x > 0 else '#FF6B6B' for x in daily_pnl.values]
+    )])
+    
+    fig.update_layout(
+        title='Daily P&L',
+        xaxis_title='Date',
+        yaxis_title='Daily P&L (USD)'
     )
     
     return fig
@@ -330,24 +381,14 @@ def main():
             
             if not st.session_state.trades_df.empty:
                 st.sidebar.success(f"✅ Successfully parsed {len(st.session_state.trades_df)} trades!")
-                st.sidebar.dataframe(st.session_state.trades_df[['trade_date', 'instrument', 'net_pnl']].head())
+                # Show a preview of the parsed data
+                preview_df = st.session_state.trades_df[['trade_date', 'instrument', 'net_pnl']].copy()
+                preview_df['trade_date'] = preview_df['trade_date'].dt.strftime('%Y-%m-%d')
+                preview_df['net_pnl'] = preview_df['net_pnl'].round(2)
+                st.sidebar.dataframe(preview_df.head())
             else:
-                st.sidebar.warning("⚠️ No trades found with current parser.")
+                st.sidebar.warning("⚠️ No trades found. The PDF format might need additional parsing rules.")
                 
-                # Enhanced debugging
-                if st.sidebar.button("Debug PDF Structure"):
-                    debug_info = parser.debug_pdf_structure("temp_statement.pdf")
-                    st.sidebar.text_area("PDF Structure Analysis:", debug_info, height=400)
-                
-                # Also show raw text for manual inspection
-                doc = fitz.open("temp_statement.pdf")
-                raw_text = ""
-                for page in doc:
-                    raw_text += page.get_text()
-                doc.close()
-                
-                st.sidebar.text_area("First 1500 chars of raw PDF text:", raw_text[:1500], height=300)
-            
         except Exception as e:
             st.sidebar.error(f"Error parsing PDF: {str(e)}")
     
@@ -440,6 +481,10 @@ def display_analysis(trades_df):
         fig = create_instrument_performance(trades_df)
         st.plotly_chart(fig, use_container_width=True)
     
+    with col2:
+        fig = create_daily_performance(trades_df)
+        st.plotly_chart(fig, use_container_width=True)
+    
     # Trade data table
     st.markdown("## 📋 Trade Details")
     
@@ -451,15 +496,6 @@ def display_analysis(trades_df):
     display_df['net_pnl'] = display_df['net_pnl'].round(2)
     
     st.dataframe(display_df, use_container_width=True)
-    
-    # Instrument analysis
-    st.markdown("## 🔍 Instrument Analysis")
-    instrument_analysis = trades_df.groupby('instrument').agg({
-        'net_pnl': ['count', 'sum', 'mean', 'std'],
-        'win': 'mean'
-    }).round(2)
-    if not instrument_analysis.empty:
-        st.dataframe(instrument_analysis, use_container_width=True)
     
     # Export data
     st.markdown("## 💾 Export Data")
