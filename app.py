@@ -10,7 +10,7 @@ from typing import List, Dict, Optional
 
 # Page configuration
 st.set_page_config(
-    page_title="Plus500 Trading Journal",
+    page_title="Futures Trading Journal",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -25,118 +25,81 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .metric-card {
-        background-color: #1E1E1E;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 4px solid #00D4AA;
+    .broker-note {
+        background-color: #2E2E2E;
+        padding: 10px;
+        border-radius: 5px;
+        border-left: 4px solid #FFA500;
+        margin-bottom: 20px;
     }
 </style>
 """, unsafe_allow_html=True)
 
 class Plus500Parser:
     def parse_pdf(self, pdf_path: str) -> pd.DataFrame:
-        """Parse Plus500 PDF statement and extract trades from activity table"""
+        """Parse Plus500 PDF statement and extract trades"""
         doc = fitz.open(pdf_path)
         full_text = ""
         for page in doc:
             full_text += page.get_text()
         doc.close()
         
-        return self._extract_trades_from_activity(full_text)
+        return self._extract_trades_simple(full_text)
     
-    def _extract_trades_from_activity(self, text: str) -> pd.DataFrame:
-        """Extract trades from YOUR ACTIVITY THIS MONTH section"""
+    def _extract_trades_simple(self, text: str) -> pd.DataFrame:
+        """Simple but robust trade extraction"""
         trades = []
-        
-        # Split by lines and find the ACTIVITY section
         lines = text.split('\n')
-        in_activity_section = False
-        activity_started = False
         
-        for i, line in enumerate(lines):
-            line = line.strip()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
             
-            # Find the start of activity section
-            if "YOUR ACTIVITY THIS MONTH" in line:
-                in_activity_section = True
-                continue
-            
-            # Look for table header to know when data starts
-            if in_activity_section and "TRADE DATE" in line and "BUY" in line and "DESCRIPTION" in line:
-                activity_started = True
-                continue
-            
-            # Process data rows in activity section
-            if in_activity_section and activity_started:
-                # Stop when we hit the next major section
-                if line and ("YOUR CASH ACTIVITY" in line or "ACCOUNT SUMMARY" in line):
-                    break
+            # Look for date patterns (MM/DD/YYYY)
+            date_match = re.match(r'^(\d{2}/\d{2}/\d{4})$', line)
+            if date_match:
+                trade_date_str = date_match.group(1)
                 
-                # Process trade rows - they contain dates and PNL/FEE info
-                if self._is_trade_row(line, lines, i):
-                    trade = self._parse_trade_row(line, lines, i)
-                    if trade:
-                        trades.append(trade)
+                # Look ahead in next lines for trade information
+                trade_info = self._find_trade_info(trade_date_str, lines[i:min(i+10, len(lines))])
+                if trade_info:
+                    trades.append(trade_info)
+                    # Skip ahead since we found a trade
+                    i += 3
+                else:
+                    i += 1
+            else:
+                i += 1
         
         return pd.DataFrame(trades)
     
-    def _is_trade_row(self, line: str, lines: List[str], current_index: int) -> bool:
-        """Check if this line is a trade row (contains date and PNL/FEE)"""
-        # Check if line has a date pattern
-        date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line)
-        if not date_match:
-            return False
+    def _find_trade_info(self, trade_date: str, context_lines: List[str]) -> Optional[Dict]:
+        """Find trade information in context lines following a date"""
+        context_text = ' | '.join([line.strip() for line in context_lines if line.strip()])
         
-        # Check if this line or nearby lines contain PNL or FEE/COMM
-        context = ' '.join(lines[max(0, current_index):min(len(lines), current_index + 3)])
-        return 'PNL' in context or 'FEE/COMM' in context
-    
-    def _parse_trade_row(self, line: str, lines: List[str], current_index: int) -> Optional[Dict]:
-        """Parse a trade row from the activity table"""
-        try:
-            # Extract date
-            date_match = re.search(r'(\d{2}/\d{2}/\d{4})', line)
-            if not date_match:
-                return None
+        # Look for PNL entries
+        pnl_matches = re.finditer(r'PNL\s+USD\s+([\(\)\d\.,]+)\*?', context_text)
+        
+        for pnl_match in pnl_matches:
+            pnl_str = pnl_match.group(1)
+            pnl = self._parse_amount(pnl_str)
             
-            trade_date = datetime.strptime(date_match.group(1), '%m/%d/%Y')
+            # Extract instrument from the context
+            instrument = self._extract_instrument(context_text)
             
-            # Look for PNL or FEE/COMM in current and next lines
-            pnl = 0.0
-            commission = 0.0
-            instrument = "Unknown"
+            # Extract exchange
             exchange = "UNKNOWN"
+            if 'CBOT' in context_text:
+                exchange = 'CBOT'
+            elif 'CME' in context_text:
+                exchange = 'CME'
             
-            # Check current line and next 2 lines for trade info
-            for j in range(current_index, min(current_index + 3, len(lines))):
-                context_line = lines[j]
-                
-                # Extract PNL
-                pnl_match = re.search(r'PNL\s+USD\s+([\(\)\d\.,]+)\*?', context_line)
-                if pnl_match:
-                    pnl_str = pnl_match.group(1)
-                    pnl = self._parse_amount(pnl_str)
-                    
-                    # Extract instrument from context
-                    instrument = self._extract_instrument_from_context(context_line)
-                    
-                    # Extract exchange
-                    if 'CBOT' in context_line:
-                        exchange = 'CBOT'
-                    elif 'CME' in context_line:
-                        exchange = 'CME'
-                
-                # Extract Commission
-                comm_match = re.search(r'FEE/COMM\s+USD\s+([\(\)\d\.,]+)\*?', context_line)
-                if comm_match:
-                    commission_str = comm_match.group(1)
-                    commission = self._parse_amount(commission_str)
+            # Find corresponding commission
+            commission = self._find_commission(context_text)
             
-            # Only return trade if we found meaningful data
-            if pnl != 0 or commission != 0:
+            if instrument:
                 return {
-                    'trade_date': trade_date,
+                    'trade_date': datetime.strptime(trade_date, '%m/%d/%Y'),
                     'instrument': instrument,
                     'exchange': exchange,
                     'pnl': pnl,
@@ -144,31 +107,32 @@ class Plus500Parser:
                     'net_pnl': pnl + commission,
                     'direction': 'LONG' if pnl > 0 else 'SHORT'
                 }
-            
-            return None
-            
-        except Exception as e:
-            st.sidebar.warning(f"Error parsing row: {line} - {str(e)}")
-            return None
+        
+        return None
     
-    def _extract_instrument_from_context(self, text: str) -> str:
-        """Extract instrument name from context"""
-        instruments = [
-            'Micro E-mini Dow Jones Industrial Average Index Futures',
-            'Micro Nikkei (USD) Futures',
-            'Micro E-mini S&P 500 Futures',
-            'Micro Gold Futures',
-            'Micro Silver Futures',
-            'Micro Crude Oil Futures'
+    def _extract_instrument(self, text: str) -> str:
+        """Extract instrument name from text"""
+        # Common Plus500 futures instruments
+        patterns = [
+            r'Micro E-mini Dow Jones Industrial Average Index Futures',
+            r'Micro Nikkei \(USD\) Futures',
+            r'Dec \d+ Micro E-mini Dow Jones Industrial Average Index Futures',
+            r'Dec \d+ Micro Nikkei \(USD\) Futures',
         ]
         
-        for instrument in instruments:
-            if instrument in text:
-                return instrument
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(0)
         
-        # Fallback: extract anything that looks like an instrument name
-        match = re.search(r'(Dec\s+\d+\s+.*?Futures|.*?Futures)', text)
-        return match.group(1) if match else "Unknown Instrument"
+        return "Unknown Instrument"
+    
+    def _find_commission(self, text: str) -> float:
+        """Find commission amount in text"""
+        comm_match = re.search(r'FEE/COMM\s+USD\s+([\(\)\d\.,]+)\*?', text)
+        if comm_match:
+            return self._parse_amount(comm_match.group(1))
+        return 0.0
     
     def _parse_amount(self, amount_str: str) -> float:
         """Parse amount string with bracket notation for losses"""
@@ -180,6 +144,43 @@ class Plus500Parser:
             return -float(number_str)
         else:
             return float(amount_str)
+    
+    def debug_pdf_structure(self, pdf_path: str) -> str:
+        """Debug method to see PDF structure"""
+        doc = fitz.open(pdf_path)
+        debug_info = "PDF STRUCTURE ANALYSIS:\n\n"
+        
+        for page_num, page in enumerate(doc):
+            text = page.get_text()
+            lines = text.split('\n')
+            
+            debug_info += f"=== PAGE {page_num + 1} ===\n"
+            debug_info += f"Total lines: {len(lines)}\n"
+            
+            # Find activity section
+            for i, line in enumerate(lines):
+                if "YOUR ACTIVITY THIS MONTH" in line:
+                    debug_info += f"Found ACTIVITY section at line {i}\n"
+                    # Show context around activity section
+                    start = max(0, i-2)
+                    end = min(len(lines), i+10)
+                    debug_info += "Context lines:\n"
+                    for j in range(start, end):
+                        debug_info += f"  {j}: {lines[j]}\n"
+                    break
+            
+            # Find dates and potential trades
+            date_lines = []
+            for i, line in enumerate(lines):
+                if re.match(r'\d{2}/\d{2}/\d{4}', line):
+                    date_lines.append(f"  Line {i}: {line}")
+            
+            if date_lines:
+                debug_info += f"Date lines found: {len(date_lines)}\n"
+                debug_info += "\n".join(date_lines[:10]) + "\n"
+        
+        doc.close()
+        return debug_info
 
 class TradingAnalysis:
     def __init__(self, trades_df: pd.DataFrame):
@@ -297,12 +298,19 @@ def create_instrument_performance(trades_df: pd.DataFrame):
     return fig
 
 def main():
-    # Header
-    st.markdown('<h1 class="main-header">📈 Plus500 Futures Trading Journal</h1>', unsafe_allow_html=True)
+    # Header with generic title
+    st.markdown('<h1 class="main-header">📈 Futures Trading Journal</h1>', unsafe_allow_html=True)
+    
+    # Broker compatibility note
+    st.markdown("""
+    <div class="broker-note">
+    <strong>Note:</strong> Currently supports Plus500 US futures statements. More brokers coming soon!
+    </div>
+    """, unsafe_allow_html=True)
     
     # Sidebar
     st.sidebar.title("Data Input")
-    st.sidebar.markdown("Upload your Plus500 monthly statement PDF")
+    st.sidebar.markdown("Upload your futures trading statement PDF")
     
     uploaded_file = st.sidebar.file_uploader("Choose PDF file", type="pdf")
     
@@ -324,15 +332,21 @@ def main():
                 st.sidebar.success(f"✅ Successfully parsed {len(st.session_state.trades_df)} trades!")
                 st.sidebar.dataframe(st.session_state.trades_df[['trade_date', 'instrument', 'net_pnl']].head())
             else:
-                st.sidebar.warning("⚠️ No trades found. The parser might need adjustment for your specific PDF format.")
-                # Debug: Show what the parser sees
-                if st.sidebar.button("Debug PDF Content"):
-                    doc = fitz.open("temp_statement.pdf")
-                    debug_text = ""
-                    for page in doc:
-                        debug_text += page.get_text()
-                    doc.close()
-                    st.sidebar.text_area("First 2000 chars of PDF:", debug_text[:2000], height=300)
+                st.sidebar.warning("⚠️ No trades found with current parser.")
+                
+                # Enhanced debugging
+                if st.sidebar.button("Debug PDF Structure"):
+                    debug_info = parser.debug_pdf_structure("temp_statement.pdf")
+                    st.sidebar.text_area("PDF Structure Analysis:", debug_info, height=400)
+                
+                # Also show raw text for manual inspection
+                doc = fitz.open("temp_statement.pdf")
+                raw_text = ""
+                for page in doc:
+                    raw_text += page.get_text()
+                doc.close()
+                
+                st.sidebar.text_area("First 1500 chars of raw PDF text:", raw_text[:1500], height=300)
             
         except Exception as e:
             st.sidebar.error(f"Error parsing PDF: {str(e)}")
@@ -346,12 +360,12 @@ def main():
 def display_welcome():
     """Display welcome message and instructions"""
     st.markdown("""
-    ## Welcome to Your Plus500 Trading Journal!
+    ## Welcome to Your Futures Trading Journal!
     
-    This app helps you analyze your futures trading performance from Plus500 statements.
+    This app helps you analyze your futures trading performance from broker statements.
     
     ### How to use:
-    1. **Upload your Plus500 monthly statement PDF** using the sidebar
+    1. **Upload your futures trading statement PDF** using the sidebar
     2. **View automated analysis** of your trading performance
     3. **Explore visualizations** to understand your trading patterns
     
@@ -444,7 +458,8 @@ def display_analysis(trades_df):
         'net_pnl': ['count', 'sum', 'mean', 'std'],
         'win': 'mean'
     }).round(2)
-    st.dataframe(instrument_analysis, use_container_width=True)
+    if not instrument_analysis.empty:
+        st.dataframe(instrument_analysis, use_container_width=True)
     
     # Export data
     st.markdown("## 💾 Export Data")
@@ -452,7 +467,7 @@ def display_analysis(trades_df):
     if st.button("Download Trade Data as CSV"):
         csv = trades_df.to_csv(index=False)
         b64 = base64.b64encode(csv.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="plus500_trades.csv">Download CSV File</a>'
+        href = f'<a href="data:file/csv;base64,{b64}" download="futures_trades.csv">Download CSV File</a>'
         st.markdown(href, unsafe_allow_html=True)
 
 if __name__ == "__main__":
